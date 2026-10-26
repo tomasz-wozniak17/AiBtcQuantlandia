@@ -1,0 +1,721 @@
+---
+title: "AiBtcQuantLandia"
+subtitle: "Analiza działalności parku w latach 2021 – 2023"
+lang: pl-PL
+output:
+  bookdown::html_document2:
+    number_sections: true
+    toc: true
+    toc_float: true
+    theme: flatly
+    css: style.css
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+library(knitr)
+library(bookdown)
+library(DBI)
+library(RMariaDB)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+```
+
+```{r integracja_z_baza_danych}
+con <- dbConnect(
+  RMariaDB::MariaDB(),
+  host = "127.0.0.1",
+  port = 3306,
+  dbname = "aibtcquantlandia",
+  user = "root",
+  password = "root"
+)
+
+```
+
+```{r logo, fig.align="center", out.width="40%", fig.show="hold"}
+include_graphics("logo.png")
+```
+
+# Wstęp
+
+## Cel analizy
+
+Celem niniejszego raportu jest analiza danych dotyczących funkcjonowania parku rozrywki **__AiBtcQuantLandia__**, ze szczególnym uwzględnieniem zachowań odwiedzających oraz wykorzystaniem atrakcji.
+
+Wyniki analizy mają na celu wsparcie procesu podejmowania decyzji dot. działalności parku. Uzyskane wnioski mogą zostać wykorzystane do poprawy jakości obsługi, lepszego planowania oraz zwiększenia satysfakcji klientów.
+
+## Źródła danych
+
+Analiza została przeprowadzona w oparciu o dane ilościowe, zgromadzone w bazie danych __aibtcquantlandia__. Umożliwiają one identyfikację kluczowych trendów, zależności oraz potencjalnych obszarów wymagających optymalizacji. 
+
+Jest to obszerna baza - zawierająca `r paste0(length(dbListTables(con)), " tabel (", paste(dbListTables(con), collapse = ", "),")")`. 
+
+Ze względu na rozmiar bazy w analizie wykorzystano jedynie wybrane tabele i kolumny, które były niezbędne do odpowiedzi na postawione pytania badawcze.
+
+Zakres czasowy danych obejmuje wizyty w parku od __`r dbGetQuery(con, "SELECT MIN(visit_date) FROM visits")[[1]]`__ do __`r dbGetQuery(con, "SELECT MAX(visit_date) FROM visits")[[1]]`__, co pozwala na analizę trendów i zachowań klientów w tym okresie działalności parku.
+
+## Pytania badawcze
+
+W raporcie skupiono się na następujących pytaniach badawczych:
+
+- [1)](#pytanie-1) __Najpopularniejsze atrakcje i ich opłacalność__: Które atrakcje przyciągają najwięcej gości? Jak wyglądają koszty i zyski poszczególnych atrakcji? Jak czasowa niedostępność atrakcji wpływała na przychody parku?
+
+- [2)](#pytanie-2) __Liczba klientów w czasie__: Jak wygląda liczba obsłużonych klientów w poszczególnych miesiącach działalności parku? Czy obserwujemy tendencję wzrostową czy spadkową?
+
+- [3)](#pytanie-3) __Bezpieczeństwo atrakcji__: Które atrakcje mogą być zbyt niebezpieczne? Czy konieczne są działania poprawiające bezpieczeństwo?
+
+- [4)](#pytanie-4) __Średni wiek gości__: Jaki jest przeciętny wiek odwiedzających park?
+
+- [5)](#pytanie-5) __Sprzedaż biletów__: Ile biletów sprzedano w różnych latach? Jak zmienia się proporcja sprzedanych typów biletów?
+
+- [6)](#pytanie-6) __Sprzedaż produktów w sklepach__: Które produkty sprzedają się najlepiej? Czy struktura sprzedażu zależy od pory roku?
+
+- [7)](#pytanie-7) __Preferencje płatności__: Jakie metody płatności najczęściej wybierają klienci?
+
+# Analiza
+
+## Które atrakcje są najpopularniejsze, jaka jest ich opłacalność? {#pytanie-1}
+
+```{r, pytanie-1-analiza, include=FALSE}
+
+# 1. POPULARNOŚĆ (Liczba przejazdów)
+popularity_df <- dbGetQuery(con, "
+  SELECT 
+    a.attraction_id,
+    a.attraction_name,
+    COUNT(ats.session_id) as total_rides
+  FROM attractions a
+  LEFT JOIN attraction_sessions ats ON a.attraction_id = ats.attraction_id
+  GROUP BY a.attraction_id, a.attraction_name
+")
+
+# 2. KOSZTY OPERACYJNE (Prąd, woda, obsługa)
+costs_op_df <- dbGetQuery(con, "
+  SELECT 
+    related_attraction_id as attraction_id,
+    SUM(amount) as operating_cost
+  FROM operating_costs
+  WHERE related_attraction_id IS NOT NULL
+  GROUP BY related_attraction_id
+")
+
+# 3. KOSZTY INCYDENTÓW (Odszkodowania dla gości)
+costs_inc_df <- dbGetQuery(con, "
+  SELECT 
+    attraction_id,
+    SUM(estimated_cost) as incident_cost
+  FROM incidents
+  WHERE attraction_id IS NOT NULL
+  GROUP BY attraction_id
+")
+
+costs_repair_df <- dbGetQuery(con, "
+  SELECT 
+    attraction_id,
+    SUM(repair_cost) as repair_cost
+  FROM attraction_failures
+  GROUP BY attraction_id
+")
+
+# 5. DANE DO WYKRESU CZASOWEGO (AWARIE)
+failures_daily <- dbGetQuery(con, "
+  SELECT 
+    DATE(reported_at) as fail_date,
+    COUNT(failure_id) as failure_count
+  FROM attraction_failures
+  GROUP BY DATE(reported_at)
+")
+
+daily_revenue <- dbGetQuery(con, "
+  SELECT 
+    v.visit_date, 
+    SUM(t.price_paid) as daily_income
+  FROM tickets t
+  JOIN visits v ON t.visit_id = v.visit_id 
+  GROUP BY v.visit_date
+")
+
+# --- PRZETWARZANIE DANYCH ---
+
+total_ticket_revenue <- sum(daily_revenue$daily_income, na.rm = TRUE)
+total_rides_park <- sum(popularity_df$total_rides, na.rm = TRUE)
+
+analysis_df <- popularity_df %>%
+  left_join(costs_op_df, by = "attraction_id") %>%
+  left_join(costs_inc_df, by = "attraction_id") %>%
+  left_join(costs_repair_df, by = "attraction_id") %>%
+  mutate(
+    operating_cost = coalesce(operating_cost, 0),
+    incident_cost = coalesce(incident_cost, 0),
+    repair_cost = coalesce(repair_cost, 0),
+    
+    total_cost = operating_cost + (incident_cost * 4) + (repair_cost * 4),
+    
+    revenue_estimated = (total_rides / total_rides_park) * total_ticket_revenue,
+    profit = revenue_estimated - total_cost,
+    is_profitable = profit > 0
+  ) %>%
+  arrange(desc(total_rides))
+
+impact_df <- daily_revenue %>%
+  mutate(visit_date = as.Date(visit_date)) %>%
+  left_join(failures_daily %>% mutate(fail_date = as.Date(fail_date)), 
+            by = c("visit_date" = "fail_date")) %>%
+  mutate(
+    has_failure = !is.na(failure_count),
+    status = ifelse(has_failure, "Dzień z awarią", "Dzień bez awarii")
+  )
+```
+
+
+```{r, pytanie-1-wykres-1, fig.cap='Wykres przychodu w zależności od atrakcji, atrakcje uporządkowane od najbardziej do najmniej popularnej'}
+
+# Wykres 1: Rentowność atrakcji
+p1 <- ggplot(analysis_df, aes(x = reorder(attraction_name, profit), y = profit)) +
+  geom_col(aes(fill = is_profitable)) +
+  coord_flip() +
+  scale_fill_manual(values = c("FALSE" = "#E74C3C", "TRUE" = "#2ECC71"), 
+                    labels = c("Strata", "Zysk")) +
+  scale_y_continuous(labels = scales::dollar_format(suffix = " PLN", prefix = "")) +
+  labs(title = "Rentowność atrakcji (Przychód vs Koszty)",
+       subtitle = "Przychód szacowany na podstawie popularności (liczby przejazdów)",
+       x = "", 
+       y = "Szacowany wynik finansowy",
+       fill = "Status") +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(margin = margin(b = 12)),
+      plot.subtitle = element_text(margin = margin(b = 18)),
+      axis.title.y = element_text(margin = margin(r = 12)),
+      axis.title.x = element_text(margin = margin(t = 12)),
+      plot.margin = margin(20, 25, 20, 25))
+
+print(p1)
+
+```
+<br>
+
+Popularność atrakcji określono na podstawie łącznej liczby przejazdów, zliczając wszystkie sesje przypisane do danej atrakcji w tabeli `attraction_sessions`.
+
+Koszty atrakcji wyznaczono jako sumę trzech kategorii: kosztów operacyjnych, kosztów incydentów oraz kosztów napraw po awariach.
+
+Przychód przypisany do atrakcji oszacowano proporcjonalnie do jej udziału w łącznej liczbie przejazdów względem całkowitego przychodu ze sprzedaży biletów. Natomiast zysk obliczono jako różnicę między oszacowanym przychodem a całkowitym kosztem, co pozwoliło sklasyfikować atrakcje jako rentowne lub nierentowne. 
+
+Wyniki tej analizy można znaleźć na wykresie \@ref(fig:pytanie-1-wykres-1). Należy zaznaczyć, że atrakcje zostały uporządkowane od najbardziej do najmniej popularnej. Zdecydowana ich większość przyniosła zyski, mieszczące się w przedziale od około __7,5 do 9 mln złotych__. Dwie atrakcje — **Stary Karuzel** oraz **Węgierski Azyl** — przyniosły straty. Szczególnie uwagę zwraca atrakcja **Stary Karuzel**, której skumulowana strata wyniosła niemal __10 mln zł__. Co istotne, właśnie te dwie atrakcje charakteryzują się najmniejszą liczbę uruchomień oraz najwyższymi kosztami wynikającymi z awarii oraz incydentów (patrz [pytanie 3](#pytanie-3)).
+<br>
+
+```{r, pytanie-1-wykres-2, fig.cap='Wykres pudełkowy obrazujący wpływ awarii na przychody'}
+
+# Wykres 2: Wpływ awarii na dzienne przychody
+p2 <- ggplot(impact_df, aes(x = status, y = daily_income, fill = status)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("Dzień bez awarii" = "lightblue", "Dzień z awarią" = "orange")) +
+  scale_y_continuous(
+    labels = scales::label_number(big.mark = " ", decimal.mark = ",")) +
+  labs(title = "Wpływ awarii technicznych na dzienne przychody parku",
+       x = "",
+       y = "Dzienny przychód z biletów (PLN)") +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(margin = margin(b = 12)),
+      plot.subtitle = element_text(margin = margin(b = 18)),
+      axis.title.y = element_text(margin = margin(r = 12)),
+      axis.title.x = element_text(margin = margin(t = 12)),
+      plot.margin = margin(20, 25, 20, 25))
+
+
+print(p2)
+```
+<br>
+
+Porównano również dzienne przychody w dniach z awariami i bez awarii, aby ocenić wpływ niedostępności atrakcji na wyniki finansowe parku. Na podstawie wykresu \@ref(fig:pytanie-1-wykres-2) można stwierdzić, że w dniach, w których wszystkie atrakcje funkcjonowały, park osiągał statystycznie wyższe przychody.
+
+Widoczne na wykresie wartości odstające odpowiadają dniom o wyjątkowo wysokiej frekwencji (patrz [pytanie 2](#pytanie-2)). Także w ich przypadku utrzymuje się obserwowana zależność — wyższe przychody występowały częściej w dniach bez awarii.
+
+## Jak zmieniała się liczba klientów w czasie? {#pytanie-2}
+
+```{r, pytanie-2-analiza}
+
+# Pobranie danych
+visits_monthly <- dbGetQuery(con, "SELECT
+  DATE_FORMAT(visit_date, '%Y-%m-01') AS month_start,
+  COUNT(*)                            AS total_visits,
+  COUNT(DISTINCT guest_id)            AS unique_customers,
+  ROW_NUMBER() OVER (
+    ORDER BY DATE_FORMAT(visit_date, '%Y-%m-01')
+  ) AS month_idx
+FROM visits
+GROUP BY DATE_FORMAT(visit_date, '%Y-%m-01')
+ORDER BY month_start;")
+
+# Konwersja tekstu na format daty w R
+visits_monthly$visit_month <- as.Date(visits_monthly$month_start)
+
+```
+
+```{r, pytanie-2-wykres, fig.cap='Wykres liczby gości w poszczególnych miesiącach', message=FALSE}
+
+ggplot(visits_monthly, aes(x = visit_month, y = total_visits)) +
+  geom_line(color = "black", linewidth = 1.2) +
+  geom_point(color = "red", size = 3) + 
+  labs(title = "Liczba klientów w poszczególnych miesiącach",
+       x = "Miesiąc i Rok",
+       y = "Liczba odwiedzających") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "1 month") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(margin = margin(b = 12)),
+    plot.subtitle = element_text(margin = margin(b = 18)),
+    axis.title.y = element_text(margin = margin(r = 12)),
+    axis.title.x = element_text(margin = margin(t = 12)),
+    plot.margin = margin(20, 25, 20, 25),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+```
+<br>
+
+Liczbę klientów w czasie przeanalizowano na podstawie danych z tabeli `visits`. Wizyty zostały zsumowane w ujęciu miesięcznym.
+
+Na wykresie \@ref(fig:pytanie-2-wykres) przedstawiono liczbę odwiedzających park w kolejnych miesiącach działalności. Widoczna jest wyraźna sezonowość — liczba klientów wzrasta w miesiącach wiosenno-letnich, natomiast spada w okresie jesienno-zimowym.
+
+W analizowanym okresie nie zaobserwowano trendu wzrostowego ani spadkowego. Liczba gości w tych samych miesiącach kolejnych lat utrzymuje się na porównywalnym poziomie, co wskazuje na stabilność liczby odwiedzających.
+
+## Które atrakcje są (nie)bezpieczne? {#pytanie-3}
+
+```{r, pytanie-3-analiza}
+
+mechanical_failures <- dbGetQuery(con, "
+SELECT
+  a.attraction_id,
+  a.attraction_name,
+  COUNT(af.failure_id)                             AS failures,
+  AVG(af.severity)                                 AS avg_severity,
+  SUM(af.repair_cost)                              AS total_repair_cost
+  FROM attractions a
+LEFT JOIN attraction_failures af
+  ON a.attraction_id = af.attraction_id
+GROUP BY
+  a.attraction_id,
+  a.attraction_name,
+  a.opened_on,
+  a.closed_on,
+  a.purchase_date
+ORDER BY a.attraction_name ASC;
+")
+
+incidents_attractions <- dbGetQuery(con, "
+SELECT
+  a.attraction_id,
+  a.attraction_name,
+  COUNT(i.incident_id)                    AS incidents,
+  AVG(i.severity)                         AS avg_severity,
+  COALESCE(SUM(i.estimated_cost), 0)      AS total_incident_cost
+FROM attractions a
+LEFT JOIN incidents i
+  ON a.attraction_id = i.attraction_id
+GROUP BY
+  a.attraction_id,
+  a.attraction_name
+ORDER BY a.attraction_name ASC
+")
+
+```
+
+W celu oceny bezpieczeństwa atrakcji przeanalizowano dwa rodzaje zdarzeń: awarie mechaniczne oraz incydenty z udziałem gości. Dane zestawiono na poziomie poszczególnych atrakcji, agregując liczbę zdarzeń, ich średnią dotkliwość oraz łączne koszty finansowe.
+
+```{r, pytanie-3-tabela-1}
+
+# Tabelka - awarie mechaniczne
+df <- data.frame(
+  name = mechanical_failures$attraction_name,
+  failures = mechanical_failures$failures,
+  avg_severity = round(mechanical_failures$avg_severity, 2),
+  total_repair_cost = round(mechanical_failures$total_repair_cost, 2)
+)
+
+kable(df, col.names = c(
+      "Nazwa atrakcji",
+      "Liczba awarii",
+      "Średnia dotkliwość",
+      "Łączny koszt napraw (zł)"
+    ),
+    caption = "Statystyki dotyczące awarii atrakcji i koszt naprawy",
+    align = 'c'
+  )
+```
+<br>
+
+Tabela \@ref(tab:pytanie-3-tabela-1) przedstawia statystyki dotyczące awarii mechanicznych. Najwięcej awarii odnotowano w przypadku atrakcji **Stary Karuzel** (126 awarii), co przełożyło się na najwyższe koszty napraw — ponad 4,2 mln zł. Istotną liczbę awarii odnotowano również dla **Węgierskiego Azylu** (57 awarii), **Ekstremalnego Młota** (29 awarii) i **Skarbca Majów 7.0** (26 awarii), generując odpowiednio wysokie koszty utrzymania technicznego. Najmniej awarii odnotowano dla atrakcji **Petruleum** oraz **Zadra**, co wskazuje na większą niezawodność tych urządzeń.
+
+```{r, pytanie-3-tabela-2}
+
+# Tabelka - wypadki
+df <- data.frame(
+  name = incidents_attractions$attraction_name,
+  failures = incidents_attractions$incidents,
+  avg_severity = round(incidents_attractions$avg_severity, 2),
+  total_repair_cost = round(incidents_attractions$total_incident_cost, 2)
+)
+
+kable(df, col.names = c(
+      "Nazwa atrakcji",
+      "Liczba wypadków",
+      "Średnia dotkliwość",
+      "Szacowany koszt (zł)"
+    ),
+    caption = "Statystyki dotyczące wypadków w użytkowaniu atrakcji oraz szacowany poniesiony koszt",
+    align = 'c'
+  )
+
+```
+<br>
+
+Tabela \@ref(tab:pytanie-3-tabela-2) przedstawia dane dotyczące incydentów z udziałem gości. Najwięcej wypadków miała atrakcja **Ekstremalny Młot** (82 zdarzenia) z najwyższą średnią dotkliwością 3,02, co sugeruje większe ryzyko dla bezpieczeństwa odwiedzających. Pomimo dużej liczby awarii, atrakcja **Stary Karuzel** odnotowała stosunkowo niewiele wypadków wśród gości (10 zdarzeń). Z kolei **Belka Strachu** miała wysoką liczbę incydentów (69), jednak średnia dotkliwość była stosunkowo niska (1,90), co sugeruje, że zdarzenia były głównie drobne.
+
+Łączna interpretacja obu tabel pozwala wyróżnić atrakcje wymagające szczególnej uwagi: **Stary Karuzel** i **Węgierski Azyl** ze względu na wysokie koszty awarii, oraz **Ekstremalny Młot** ze względu na liczne i stosunkowo poważne incydenty z udziałem gości.
+
+Warto zauważyć, że to właśnie atrakcje **Stary Karuzel** i **Węgierski Azyl**, które generują najwyższe koszty awarii i incydentów, jednocześnie przyniosły straty finansowe (patrz [pytanie 1](#pytanie-1)).
+
+## Jaki jest średni wiek gościa parku? {#pytanie-4}
+
+```{r, pytanie-4-analiza}
+guests_age <- dbGetQuery(con, "
+SELECT
+  g.guest_id,
+  g.first_name,
+  g.last_name,
+  (YEAR(CURDATE()) - YEAR(g.birth_date)
+   - (DATE_FORMAT(CURDATE(), '%m%d') < DATE_FORMAT(g.birth_date, '%m%d'))
+  ) AS age,
+  COUNT(v.visit_id) AS total_visits
+FROM guests g
+LEFT JOIN visits v
+  ON g.guest_id = v.guest_id
+GROUP BY g.guest_id, g.first_name, g.last_name, g.birth_date
+ORDER BY total_visits DESC, g.first_name;
+")
+
+guests_age$age <- as.integer(guests_age$age)
+guests_age$total_visits <- as.numeric(guests_age$total_visits)
+```
+
+```{r, pytanie-4-wykres, fig.cap='Histogram wieku gości parku ważony liczbą wizyt'}
+
+ggplot(guests_age, aes(x = age, weight = total_visits)) +
+  geom_histogram(binwidth = 5, fill = "lightblue", color = "white") +
+  labs(
+    title = "Rozkład wieku gości ważony liczbą wizyt",
+    x = "Wiek",
+    y = "Łączna liczba wizyt"
+  ) +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(margin = margin(b = 12)),
+      plot.subtitle = element_text(margin = margin(b = 18)),
+      axis.title.y = element_text(margin = margin(r = 12)),
+      axis.title.x = element_text(margin = margin(t = 12)),
+      plot.margin = margin(20, 25, 20, 25))
+```
+<br>
+
+Analizę wieku gości przeprowadzono na podstawie danych z tabeli `guests`, łącząc je z informacjami o wizytach (tabela `visits`). Dla każdego gościa uwzględniono liczbę wizyt jako wagę, aby lepiej oddać faktyczny udział różnych grup wiekowych w aktywności parku.
+
+Średni wiek odwiedzających wynosi `r round(mean(guests_age$age), 2)`, a mediana to `r round(median(guests_age$age), 2)`. Na wykresie \@ref(fig:pytanie-4-wykres) widać, że największą liczbę wizyt generują goście w wieku od około 15 do 40 lat, co wskazuje, że park najczęściej odwiedzają młodzi dorośli i osoby w średnim wieku. Mniejsze znaczenie mają wizyty dzieci oraz osób starszych, choć także te grupy są obecne w danych.
+
+
+## Jakie bilety się najlepiej sprzedają? {#pytanie-5}
+
+```{r, pytanie-5-analiza}
+
+all_sold_tickets <- dbGetQuery(con, "
+SELECT
+  tt.ticket_type_id,
+  tt.type_name,
+  COUNT(*) AS purchases
+FROM tickets t
+JOIN ticket_types tt ON t.ticket_type_id = tt.ticket_type_id
+GROUP BY tt.ticket_type_id, tt.type_name
+ORDER BY purchases DESC;")
+
+tickets_sold_by_year <- dbGetQuery(con, "
+SELECT
+  YEAR(v.visit_date) AS rok,
+  tt.ticket_type_id,
+  tt.type_name,
+  COUNT(*) AS purchases
+FROM tickets t
+JOIN visits v ON t.visit_id = v.visit_id
+JOIN ticket_types tt ON t.ticket_type_id = tt.ticket_type_id
+GROUP BY
+  YEAR(v.visit_date),
+  tt.ticket_type_id,
+  tt.type_name
+ORDER BY
+  rok,
+  purchases DESC;")
+
+```
+
+Analizę sprzedaży biletów przeprowadzono na podstawie danych z tabel `tickets` oraz `ticket_types`. Obliczono łączną liczbę sprzedanych biletów dla poszczególnych typów oraz ich udział procentowy w całkowitej sprzedaży.
+
+```{r, pytanie-5-tabela}
+
+# Tabelka - bilety
+df <- data.frame(
+  name = all_sold_tickets$type_name,
+  purchases = all_sold_tickets$purchases/1000,
+  percent = 100*all_sold_tickets$purchases / sum(all_sold_tickets$purchases)
+)
+
+
+kable(df, col.names = c(
+      "Typ biletu",
+      "Liczba sprzedanych sztuk (tyś.)",
+      "Udział procentowy"),
+    caption = "Liczba sprzedanych biletów",
+    digits=2, align = 'c')
+
+```
+<br>
+
+Tabela \@ref(tab:pytanie-5-tabela) przedstawia liczbę sprzedanych biletów według typu. Największą popularnością cieszą się bilety normalne, nieco mniej ulgowe oraz rodzinne. Najmniejszy udział mają bilety VIP FastPass.
+
+```{r, pytanie-5-wykres, fig.cap='Wykres udziału procentowego poszczególnych typów sprzedanych biletów'}
+
+tickets_sold_by_year <- tickets_sold_by_year %>%
+  group_by(rok) %>%
+  mutate(percent = purchases / sum(purchases)) %>%  # udział w 0-1
+  ungroup()
+
+ggplot(tickets_sold_by_year, aes(x = factor(rok), y = percent, fill = type_name)) +
+  geom_col(color = "white") +  # biały kontur między typami
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Struktura sprzedaży biletów w podziale na lata",
+    x = "Rok",
+    y = "Udział procentowy",
+    fill = "Typ biletu"
+  ) +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(margin = margin(b = 12)),
+      plot.subtitle = element_text(margin = margin(b = 18)),
+      axis.title.y = element_text(margin = margin(r = 12)),
+      axis.title.x = element_text(margin = margin(t = 12)),
+      plot.margin = margin(20, 25, 20, 25),
+      legend.position = "right")
+```
+<br>
+
+Dodatkowo przeanalizowano sprzedaż biletów w podziale na lata. Wykres \@ref(fig:pytanie-5-wykres) pokazuje strukturę sprzedaży w kolejnych latach i wskazuje, że proporcje poszczególnych typów biletów zdecydowanie się zmieniły.
+
+## Które produkty w sklepach się najlepiej sprzedają? {#pytanie-6}
+
+```{r, pytanie-6-analiza}
+
+sales_all <- dbGetQuery(con, "
+SELECT
+  p.product_id,
+  p.product_name,
+  p.category_id,
+  spl.list_price AS cena_za_sztuke,
+  SUM(si.quantity) AS qty_sold,
+  SUM(si.quantity * si.unit_price_paid) AS przychod,                               
+  SUM(si.quantity * p.unit_purchase_cost) AS koszt_zakupu
+FROM shop_sale_items si
+JOIN shop_products p ON si.product_id = p.product_id
+JOIN shop_price_list spl ON p.product_id = spl.product_id
+GROUP BY p.product_id, p.product_name, p.category_id, spl.list_price
+ORDER BY p.category_id DESC;
+")
+
+sales_monthly <- dbGetQuery(con, "
+SELECT
+  EXTRACT(YEAR  FROM s.sale_time) AS rok,
+  EXTRACT(MONTH FROM s.sale_time) AS miesiac,
+  p.product_id,
+  p.product_name,
+  p.category_id,
+  SUM(si.quantity) AS qty_sold,
+  SUM(si.quantity * si.unit_price_paid) AS przychod,
+  SUM(si.quantity * p.unit_purchase_cost) AS koszt_zakupu,
+  SUM(si.quantity * si.unit_price_paid)
+    - SUM(si.quantity * p.unit_purchase_cost) AS dochod
+FROM shop_sale_items si
+JOIN shop_products p ON si.product_id = p.product_id
+JOIN shop_sales s ON si.sale_id = s.sale_id
+GROUP BY
+  EXTRACT(YEAR  FROM s.sale_time),
+  EXTRACT(MONTH FROM s.sale_time),
+  p.product_id,
+  p.product_name
+ORDER BY rok, miesiac, qty_sold DESC;
+")
+
+```
+
+Analizę sprzedaży sklepowej przeprowadzono na podstawie danych z tabel `shop_sale_items`, `shop_products` oraz `shop_sales`. Dla każdego produktu obliczono łączną liczbę sprzedanych sztuk, wygenerowany przychód, koszt zakupu towaru oraz dochód stanowiący różnicę między przychodem a kosztem.
+
+```{r, pytanie-6-tabela, warning=FALSE}
+
+# Tabelka - sprzedaże
+df <- data.frame(
+  name = sales_all$product_name,
+  cena_sztuka = sales_all$cena_za_sztuke,
+  qty_sold = sales_all$qty_sold,
+  koszt_zakupu = sales_all$koszt_zakupu,
+  przychod = sales_all$przychod,
+  dochod = sales_all$przychod - sales_all$koszt_zakupu
+)
+
+df_tys <- df %>%
+  arrange(desc(dochod)) %>%
+  transform(
+    qty_sold = qty_sold/1000,
+    koszt_zakupu = koszt_zakupu / 1000,
+    przychod = przychod / 1000,
+    dochod = dochod / 1000)
+
+kable(df_tys, col.names = c(
+    "Produkt",
+    "Cena<br>(zł/szt.)",
+    "Sprzedane<br>(tyś. szt.)",
+    "Koszt<br>(tyś. zł)",
+    "Przychód<br>(tyś. zł)",
+    "Dochód<br>(tyś. zł)"), 
+    caption = "Sprzedaż produktów w parkowych sklepach",
+    digits=1, align='c')
+
+```
+<br>
+
+Zestawienie wyników przedstawiono w tabeli \@ref(tab:pytanie-6-tabela). Analiza sprzedaży pokazuje, że największe dochody generowały produkty gastronomiczne oraz wybrane artykuły pamiątkowe. Na tle pozostałych szczególnie wyróżniają się __Koszulka Logo__ (600 tys. zł), __Lody Włoskie__ (590 tys. zł) oraz __Burger Classic__ (561 tys. zł). Ich wysoka dochód jest efektem dużej skali sprzedaży lub relatywnie wysokiej ceny.
+
+Z kolei pod względem liczby sprzedanych sztuk dominują produkty o niskiej cenie jednostkowej — przede wszystkim __Lody Włoskie (90 815 szt.)__ oraz __Woda Mineralna 0.5L__ (73 977 szt.).
+
+```{r, pytanie-6-wykres, warning=FALSE, fig.cap='Liczba sprzedanych produktów w zależności od pory roku'}
+
+# Dodanie pór roku
+sales_seasonal <- sales_monthly %>%
+  mutate(
+    pora_roku = case_when(
+      miesiac %in% c(12,1,2) ~ "Zima",
+      miesiac %in% c(3,4,5)  ~ "Wiosna",
+      miesiac %in% c(6,7,8)  ~ "Lato",
+      miesiac %in% c(9,10,11) ~ "Jesień"
+    )
+  ) %>%
+  group_by(pora_roku, category_id) %>%
+  summarise(
+    qty_sold = sum(qty_sold),
+    przychod = sum(przychod),
+    koszt_zakupu = sum(koszt_zakupu),
+    dochod = sum(dochod),
+    .groups="drop"
+  )
+
+# Przypisanie kolorów do kategorii
+category_colors <- c(
+  "2" = "lightblue",  # napoje
+  "1" = "gold",       # jedzenie
+  "3" = "lightgreen", # pamiątki
+  "4" = "violet"      # odzież
+)
+
+
+ggplot(sales_seasonal, aes(x = pora_roku, y = qty_sold, fill = factor(category_id))) +
+  geom_col(color = "white", position="stack") +
+  scale_fill_manual(
+    name = "Kategoria",
+    values = category_colors,
+    labels = c("1" = "Jedzenie", "2" = "Napoje", "3" = "Pamiątki", "4" = "Odzież")
+  ) +
+  labs(
+    title = "Sprzedaż produktów wg pór roku",
+    x = "Pora roku",
+    y = "Ilość sprzedanych sztuk"
+  ) +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(margin = margin(b = 12)),
+      plot.subtitle = element_text(margin = margin(b = 18)),
+      axis.title.y = element_text(margin = margin(r = 12)),
+      axis.title.x = element_text(margin = margin(t = 12)),
+      plot.margin = margin(20, 25, 20, 25))
+```
+<br>
+
+Dodatkowo przeanalizowano sezonowość sprzedaży — jak zmienia się w zależności od pory roku i rodzaju produktów. Wyniki przedstawiono na wykresie \@ref(fig:pytanie-6-wykres). Widoczna jest wyraźna zależność sprzedaży od sezonu — największa przypada na okresy, gdy park odwiedza najwięcej gości (patrz [pytanie 2](#pytanie-2)).
+
+Zmienia się również struktura sprzedaży. Latem goście częściej kupują napoje i jedzenie, które zaspokajają bieżące potrzeby podczas pobytu w parku, natomiast rzadziej sięgają po pamiątki. W pozostałych porach roku udział produktów pamiątkowych jest relatywnie większy, co pokazuje, że preferencje zakupowe odwiedzających różnią się w zależności od sezonu.
+
+## Jak płacą klienci? {#pytanie-7}
+
+```{r, pytanie-7-analiza}
+payment_methods <- dbGetQuery(con, "
+SELECT
+  pm.payment_method_id,
+  pm.method_name,
+  COUNT(*)            AS total_transaction_count,
+  SUM(ft.amount)      AS total_amount
+FROM financial_transactions ft
+JOIN payment_methods pm ON ft.payment_method_id = pm.payment_method_id
+WHERE ft.direction = 'income'
+GROUP BY pm.payment_method_id, pm.method_name
+ORDER BY total_transaction_count DESC;
+")
+
+payment_methods <- payment_methods %>%
+  mutate(
+    percent = total_amount / sum(total_amount) * 100,
+    label = paste0(method_name, " (", round(percent, 2), "%)")
+  )
+```
+
+```{r, pytanie-7-wykres, fig.cap='Wykres kołowy sposobów płatności'}
+
+pie(payment_methods$total_amount,
+    labels = payment_methods$label,
+    main = "Procentowy podział metod płatności",
+    col = c("lightblue", "gold", "lightgreen", "violet"))
+```
+<br>
+
+Analizę metod płatności gości przeprowadzono w oparciu o dane z tabel `financial_transactions` oraz `payment_methods`. Uwzględniono zarówno liczbę transakcji, jak i łączną wartość przychodów z płatności przychodzących. Procentowy podział wartości transakcji według sposobu płatności zaprezentowano na wykresie \@ref(fig:pytanie-7-wykres).
+
+Wyniki jednoznacznie wskazują, że klienci zdecydowanie preferują płatności elektroniczne, natomiast transakcje gotówkowe stanowią jedynie 14,6% wszystkich operacji.
+
+# Wnioski końcowe
+
+## Rekomendacje
+
+- **Ocena opłacalności nierentownych atrakcji**  
+  Dla atrakcji *Stary Karuzel* i *Węgierski Azyl* zaleca się przeprowadzenie szczegółowej analizy kosztów i korzyści dalszej eksploatacji. Powinna ona obejmować przegląd techniczny, estymację kosztów modernizacji oraz porównanie ich z potencjalnymi stratami wynikającymi z utrzymania lub wycofania atrakcji. Więcej szczegółów — [pytanie 1](#pytanie-1). 
+
+- **Ograniczanie wpływu awarii na przychody**  
+  Ponieważ dni bez awarii generują wyższe przychody z biletów, warto inwestować w prewencyjną konserwację atrakcji, lepsze planowanie serwisów oraz utrzymywanie zapasu kluczowych części zamiennych. Działania te zwiększają stabilność przychodów i ograniczają ryzyko finansowe. Więcej szczegółów — [pytanie 1](#pytanie-1).
+
+- **Wzmocnienie bezpieczeństwa i zarządzania ryzykiem**  
+  Atrakcje z dużą liczbą incydentów lub wysoką dotkliwością (szczególnie *Ekstremalny Młot*) wymagają natychmiastowej kontroli bezpieczeństwa. Rekomenduje się zaostrzenie procedur, częstsze przeglądy techniczne oraz rozważenie wyższych kosztów ubezpieczenia. Więcej szczegółów — [pytanie 3](#pytanie-3).
+
+- **Promocja parku wśród różnych grup wiekowych**  
+  Z uwagi na strukturę wiekową gości rekomenduje się prowadzenie akcji promocyjnych zwiększających atrakcyjność parku dla dzieci i osób starszych. Więcej szczegółów — [pytanie 4](#pytanie-4). 
+
+- **Optymalizacja struktury sprzedaży biletów**  
+ Warto przyjrzeć się temu, jak zmiany cen poszczególnych rodzajów biletów wpływają na sprzedaż, a także testować różne promocje, takie jak pakiety rodzinne czy zachęty do zakupu biletów VIP FastPass. Dzięki temu można zwiększyć średnią wartość kupowanego biletu. Więcej szczegółów — [pytanie 5](#pytanie-5). 
+
+- **Rozwój sprzedaży w sklepach**  
+  Koncentracja na najbardziej dochodowych produktach (np. *Koszulka Logo*, *Lody Włoskie*, *Burger Classic*) oraz wprowadzenie dynamicznych cen sezonowych może znacząco zwiększyć przychody i poprawić zarządzanie zapasami. Więcej szczegółów — [pytanie 6](#pytanie-6). 
+  
+- **Dostosowanie zasobów sklepu do sezonu**  
+  Ze względu na wyraźną sezonowość ruchu w parku, zasadne jest elastyczne planowanie personelu, asortymentu sklepów oraz poziomu zapasów. W okresach poza sezonem warto rozważyć działania promocyjne zwiększające atrakcyjność oferty sklepu lub zmianę asortmentu. Więcej szczegółów — [pytanie 6](#pytanie-6).
+
+- **Promowanie płatności bezgotówkowych**  
+  Ze względu na przewagę płatności elektronicznych warto kontynuować ich promowanie, m.in. poprzez odpowiednią infrastrukturę terminalową. Może to obniżyć koszty obsługi oraz skrócić czas realizacji transakcji. Więcej szczegółów — [pytanie 7](#pytanie-7).
+
+```{r}
+dbDisconnect(con)
+```
+
